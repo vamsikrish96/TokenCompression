@@ -1,0 +1,42 @@
+compresskit
+===========
+
+This package is a vendored, dependency-free subset of Headroom, adapted to run
+on the Python standard library alone.
+
+Portions Copyright 2025 Headroom Contributors, licensed under the Apache
+License, Version 2.0. See LICENSE in this directory for the full text.
+
+Files taken from Headroom, with their upstream paths
+----------------------------------------------------
+
+  masks.py                     headroom/compression/masks.py
+  handlers/base.py             headroom/compression/handlers/base.py
+  handlers/json_handler.py     headroom/compression/handlers/json_handler.py
+  handlers/code_handler.py     headroom/compression/handlers/code_handler.py
+  segmenter.py                 headroom/transforms/mixed_content.py
+  lossless.py                  headroom/transforms/lossless_compaction.py
+
+Statement of changes (Apache-2.0 section 4b)
+--------------------------------------------
+
+  * Absolute ``headroom.*`` imports were rewritten as relative imports, so the
+    folder can be vendored under any name.
+  * detector.py replaces Headroom's Magika-based ML detection with rules; it is
+    original to this package, not a port.
+  * reducers.py replaces Kompress, Headroom's learned span compressor, with
+    deterministic rules; also original to this package.
+  * segmenter.py drops the tag-protection placeholder isolation, which depends
+    on Headroom's Rust extension, and types log lines ahead of search results.
+  * handlers/text_handlers.py, handlers/mixed_handler.py and
+    handlers/data_handlers.py are original to this package.
+  * lossless.py is unchanged apart from its module docstring.
+  * The CCR retrieval store was removed; CompressionResult.original carries the
+    input instead.
+
+Not included
+------------
+
+Headroom's log, diff, search and text compressors are implemented in Rust
+(``headroom._core``) and cannot be vendored as a source folder. The handlers
+here are independent rule-based implementations.
