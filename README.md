@@ -176,13 +176,39 @@ Everything is a constructor argument; nothing is global.
 | `ReducerConfig.marker`                      | `" ... "` | Marks where a span's middle was cut. `""` removes it       |
 | `ReducerConfig.dedupe_lines`                | `True`  | Collapse repeated consecutive lines — the big win on logs  |
 | `CompressorConfig.min_content_length`       | `100`   | Below this, content is returned untouched                  |
-| `CompressorConfig.min_span_length`          | `50`    | Below this, a reducible span is left untouched             |
+| `CompressorConfig.min_span_length`          | `50`    | Below this, a reducible span is left untouched. Drop to 20-30 for logs |
+| `CompressorConfig.use_lossless`             | `True`  | Reversible pre-pass. No reason to turn it off              |
 | `CompressorConfig.use_entropy_preservation` | `True`  | Preserve high-entropy words wherever they appear           |
 | `CompressorConfig.entropy_threshold`        | `0.85`  | Higher is more selective about what counts as a secret     |
 | `JSONStructureHandler.short_value_threshold`| `20`    | String values this short are kept verbatim                 |
 | `JSONStructureHandler.max_array_items_full` | `3`     | Array items past this are compressed harder                |
 | `LogStructureHandler.severity_floor`        | `WARN`  | Lines at or above this level survive whole                 |
 | `DiffStructureHandler.preserve_context`     | `False` | `True` keeps the patch applicable, at the cost of the ratio |
+| `TabularStructureHandler.full_rows`         | `3`     | Data rows kept verbatim as worked examples                 |
+| `ConfigStructureHandler.preserve_comments`  | `True`  | Config comments usually explain a choice; keep them        |
+
+### Which knob to reach for
+
+The four that matter, and what each is actually for:
+
+- **`target_ratio`** — how much of each *reducible* span to keep. It never
+  touches structure, so past about 0.2 the returns fall away against a floor of
+  protected text. Start at 0.3, lower it, and stop when the answers change.
+- **`marker`** — the model's only signal that text was removed. `""` buys about
+  10 points of ratio and gives that signal up. `" ... "` is the sweet spot; the
+  old `" ...[compressed]... "` default cost ~9 points for no extra meaning.
+- **`min_span_length`** — the smallest gap worth compressing. Bulk JSON leaves
+  big gaps, so 50 is right. Logs leave small ones (a 45-character message after
+  a preserved timestamp) and yield **nothing at all** until you drop to 20-30.
+- **`min_content_length`** — the library default of 100 is too low for a
+  gateway. Use 2000+.
+
+The UI's **offline** checkbox has no library equivalent: it only tells the UI to
+skip its two API calls. Compression never calls out to anything.
+
+Everything else is safe on its defaults. `use_lossless` and
+`use_entropy_preservation` should stay on -- one is free, the other is what
+keeps secrets in the payload.
 
 ## Swapping pieces out
 
