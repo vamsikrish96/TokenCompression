@@ -37,6 +37,7 @@ Ported from Headroom's ``headroom/transforms/lossless_compaction.py``
 
 from __future__ import annotations
 
+import json
 import re
 
 __all__ = [
@@ -51,6 +52,11 @@ __all__ = [
     "search_dir_heading",
     "search_dir_unheading",
     "diff_strip_index",
+    "json_fold_constants",
+    "json_unfold_constants",
+    "tabular_fold_constants",
+    "tabular_unfold_constants",
+    "split_fold_note",
     "compact_lossless",
 ]
 
@@ -454,6 +460,475 @@ def path_unheading(text: str) -> str:
     return _join(out, had_trailing)
 
 
+# ---------------------------------------------------------------------------
+# Cross-record constant folding
+#
+# Every fold above works on repeated *lines*. This one works on repeated
+# *fields*: 60 records that each carry "role": "member" hold that fact 60
+# times, and no line-level or span-level trick can see it -- the repeats are
+# never adjacent and never long enough to truncate. Stating the fact once and
+# removing it from every record is the only way to reach it.
+#
+# The removal changes the payload's shape, which is safe when a model reads the
+# data to answer a question and unsafe when the payload is the template for the
+# model's own output ("return me this JSON with X changed"). Nothing here can
+# tell those apart, so the caller decides: see CompressorConfig.
+# ---------------------------------------------------------------------------
+
+#: Below this many records the note costs more than the fold saves.
+_FOLD_MIN_RECORDS = 10
+
+#: The machine-readable half of the note. Everything the inverse needs is on
+#: this one line; the prose above it is for the model.
+_JSON_RESTORE_PREFIX = "// compresskit-restore: "
+
+_WHITESPACE = " \t\n\r"
+
+
+class _JsonShapeError(ValueError):
+    """The document is not a shape this fold can safely rewrite."""
+
+
+def _json_ws(text: str, index: int) -> int:
+    """Index of the next non-whitespace character at or after ``index``."""
+    while index < len(text) and text[index] in _WHITESPACE:
+        index += 1
+    return index
+
+
+def _json_string_end(text: str, index: int) -> int:
+    """Index just past the string literal starting at ``index``."""
+    index += 1  # opening quote
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == '"':
+            return index + 1
+        index += 1
+    raise _JsonShapeError("unterminated string")
+
+
+def _json_value_end(text: str, index: int, arrays: list) -> int:
+    """Index just past the value starting at ``index``.
+
+    Arrays met along the way are appended to ``arrays`` as
+    ``(start, end, elements)``, so one scan finds every candidate record set
+    rather than re-walking the document once per array.
+    """
+    char = text[index]
+    if char == '"':
+        return _json_string_end(text, index)
+    if char == "{":
+        return _json_object(text, index, arrays)[1]
+    if char == "[":
+        return _json_array(text, index, arrays)
+    scan = index
+    while scan < len(text) and text[scan] not in ",]}" + _WHITESPACE:
+        scan += 1
+    if scan == index:
+        raise _JsonShapeError("empty value")
+    return scan
+
+
+def _json_object(text: str, index: int, arrays: list) -> tuple[list, int]:
+    """Members of the object at ``index``, and the index just past its ``}``.
+
+    A member is ``(key_start, val_end)``; the raw slice between them is the
+    member verbatim, which is what the fold splices. Working in raw offsets
+    rather than parsed values is deliberate -- ``json.dumps`` will not
+    reproduce the input's indentation, key order or spacing, and the round trip
+    here is checked byte for byte.
+    """
+    members: list[tuple[int, int]] = []
+    index = _json_ws(text, index + 1)
+    if index < len(text) and text[index] == "}":
+        return members, index + 1
+
+    while True:
+        index = _json_ws(text, index)
+        if index >= len(text) or text[index] != '"':
+            raise _JsonShapeError("object key is not a string")
+        key_start = index
+        index = _json_ws(text, _json_string_end(text, index))
+        if index >= len(text) or text[index] != ":":
+            raise _JsonShapeError("missing colon")
+        index = _json_ws(text, index + 1)
+        val_end = _json_value_end(text, index, arrays)
+        members.append((key_start, val_end))
+
+        index = _json_ws(text, val_end)
+        if index >= len(text):
+            raise _JsonShapeError("truncated object")
+        if text[index] == ",":
+            index += 1
+            continue
+        if text[index] == "}":
+            return members, index + 1
+        raise _JsonShapeError("bad object separator")
+
+
+def _json_array(text: str, index: int, arrays: list) -> int:
+    """Index just past the array at ``index``; records it in ``arrays``."""
+    start = index
+    elements: list[tuple[int, int, list | None]] = []
+    index = _json_ws(text, index + 1)
+    if index < len(text) and text[index] == "]":
+        arrays.append((start, index + 1, elements))
+        return index + 1
+
+    while True:
+        index = _json_ws(text, index)
+        element_start = index
+        if text[index] == "{":
+            members, element_end = _json_object(text, index, arrays)
+            elements.append((element_start, element_end, members))
+        else:
+            element_end = _json_value_end(text, index, arrays)
+            elements.append((element_start, element_end, None))
+
+        index = _json_ws(text, element_end)
+        if index >= len(text):
+            raise _JsonShapeError("truncated array")
+        if text[index] == ",":
+            index += 1
+            continue
+        if text[index] == "]":
+            arrays.append((start, index + 1, elements))
+            return index + 1
+        raise _JsonShapeError("bad array separator")
+
+
+def _json_pick_records(text: str) -> tuple[int, int, list] | None:
+    """The largest array of objects in ``text``, or None if there is no fold.
+
+    Chosen by element *count*, not text length: folding removes characters but
+    never elements, so the same array wins before and after. The inverse relies
+    on that -- it has to find the same array again in the folded text.
+    """
+    arrays: list = []
+    start = _json_ws(text, 0)
+    if start >= len(text):
+        return None
+    _json_value_end(text, start, arrays)
+
+    best = None
+    for array_start, array_end, elements in arrays:
+        if len(elements) < _FOLD_MIN_RECORDS:
+            continue
+        if any(members is None for _, _, members in elements):
+            continue  # not a record set
+        if any(not members for _, _, members in elements):
+            continue  # an empty object has nothing to fold
+        if best is None or len(elements) > len(best[2]):
+            best = (array_start, array_end, elements)
+    return best
+
+
+def _json_layout(text: str, elements: list) -> tuple[str, list[list[str]]]:
+    """The one separator every record uses, and each record's raw members.
+
+    Raises if records disagree on member count or on the exact text between
+    members. Reconstruction joins with a single separator, so a document
+    hand-formatted enough to vary is refused rather than silently reflowed.
+    """
+    separators: set[str] = set()
+    records: list[list[str]] = []
+
+    for _, _, members in elements:
+        records.append([text[start:end] for start, end in members])
+        for position in range(len(members) - 1):
+            separators.add(text[members[position][1] : members[position + 1][0]])
+
+    if len(separators) != 1:
+        raise _JsonShapeError("records are not uniformly formatted")
+    if len({len(record) for record in records}) != 1:
+        raise _JsonShapeError("records have different member counts")
+    return separators.pop(), records
+
+
+def _json_member_key(member: str) -> str:
+    """The raw key text of a ``"key": value`` member."""
+    return member.split(":", 1)[0].strip()
+
+
+def json_fold_constants(text: str) -> str:
+    """Lift fields that never vary out of a homogeneous record array.
+
+    The fields are stated once in a leading comment and removed from every
+    record. Returns ``text`` unchanged whenever the document is not a shape
+    this can rewrite exactly -- that is the common case, and it is not a
+    failure.
+
+    Example:
+        >>> folded = json_fold_constants(payload)   # doctest: +SKIP
+        >>> json_unfold_constants(folded) == payload
+        True
+    """
+    if _JSON_RESTORE_PREFIX in text:
+        return text  # already folded
+    try:
+        picked = _json_pick_records(text)
+        if picked is None:
+            return text
+        array_start, _, elements = picked
+        separator, records = _json_layout(text, elements)
+
+        width = len(records[0])
+        keys = [_json_member_key(member) for member in records[0]]
+        for record in records:
+            if [_json_member_key(member) for member in record] != keys:
+                raise _JsonShapeError("records disagree on key order")
+
+        constant = [
+            position
+            for position in range(width)
+            if len({record[position] for record in records}) == 1
+        ]
+        # Folding every field would leave empty records with nothing to key the
+        # restored values against, and nothing for the model to read.
+        if not constant or len(constant) >= width:
+            return text
+
+        dropped = set(constant)
+        keep = [position for position in range(width) if position not in dropped]
+
+        pieces: list[str] = []
+        cursor = array_start
+        for element_start, element_end, members in elements:
+            pieces.append(text[cursor:element_start])
+            prefix = text[element_start : members[0][0]]
+            tail = text[members[-1][1] : element_end]
+            body = separator.join(
+                text[members[position][0] : members[position][1]] for position in keep
+            )
+            pieces.append(prefix + body + tail)
+            cursor = element_end
+        pieces.append(text[cursor:])
+
+        fields = [[position, records[0][position]] for position in constant]
+        folded = text[:array_start] + "".join(pieces)
+        return _json_note(len(elements), separator, fields) + folded
+    except (_JsonShapeError, ValueError, IndexError):
+        return text
+
+
+def _json_note(count: int, separator: str, fields: list) -> str:
+    """The comment block that carries the folded fields.
+
+    Two audiences, one block. The prose tells the model to apply the fields to
+    every record -- without that instruction it reads the note and then answers
+    from the visible fields alone. The ``compresskit-restore`` line is what
+    :func:`json_unfold_constants` reads: one line of JSON, so restoring never
+    has to parse English.
+    """
+    listed = ", ".join(field[1] for field in fields)
+    payload = json.dumps({"sep": separator, "fields": fields}, separators=(",", ":"))
+    return (
+        f"// compresskit: every object in the largest array below also has {listed}.\n"
+        f"// Identical in all {count} entries, removed here to save space -- treat\n"
+        f"// every entry as if it still contained them.\n"
+        f"{_JSON_RESTORE_PREFIX}{payload}\n"
+    )
+
+
+def json_unfold_constants(text: str) -> str:
+    """Exact inverse of :func:`json_fold_constants`."""
+    if not text.startswith("// compresskit"):
+        return text
+    try:
+        lines = text.split("\n")
+        body = None
+        for position, line in enumerate(lines):
+            if line.startswith(_JSON_RESTORE_PREFIX):
+                payload = json.loads(line[len(_JSON_RESTORE_PREFIX) :])
+                body = "\n".join(lines[position + 1 :])
+                break
+        if body is None:
+            return text
+
+        separator = payload["sep"]
+        fields = {int(index): raw for index, raw in payload["fields"]}
+
+        picked = _json_pick_records(body)
+        if picked is None:
+            return text
+        array_start, _, elements = picked
+
+        pieces: list[str] = []
+        cursor = array_start
+        for element_start, element_end, members in elements:
+            pieces.append(body[cursor:element_start])
+            prefix = body[element_start : members[0][0]]
+            tail = body[members[-1][1] : element_end]
+            kept = iter(body[start:end] for start, end in members)
+            restored = [
+                fields[position] if position in fields else next(kept)
+                for position in range(len(members) + len(fields))
+            ]
+            pieces.append(prefix + separator.join(restored) + tail)
+            cursor = element_end
+        pieces.append(body[cursor:])
+
+        return body[:array_start] + "".join(pieces)
+    except (_JsonShapeError, ValueError, KeyError, IndexError, StopIteration):
+        return text
+
+
+_TABULAR_RESTORE_PREFIX = "# compresskit-restore: "
+
+
+def _tabular_rows(lines: list[str], separator: str) -> list[int] | None:
+    """Indices of the lines that are rows, or None if the shape is irregular.
+
+    Blank lines are not rows and are passed through untouched. Every row must
+    carry the same field count as the header; a ragged file is refused rather
+    than folded against a column that is not there.
+    """
+    rows = [index for index, line in enumerate(lines) if line.strip()]
+    if len(rows) < _FOLD_MIN_RECORDS + 1:  # header plus the record floor
+        return None
+    width = lines[rows[0]].count(separator)
+    if width < 1:
+        return None
+    if any(lines[index].count(separator) != width for index in rows):
+        return None
+    return rows
+
+
+def tabular_fold_constants(text: str) -> str:
+    """Lift columns whose value never varies out of delimited rows.
+
+    The columns are stated once in a leading comment and removed from the
+    header and every row. Returns ``text`` unchanged whenever the shape is
+    irregular or nothing is constant.
+    """
+    if _TABULAR_RESTORE_PREFIX in text:
+        return text  # already folded
+    # A quoted field may contain the separator, which would make naive
+    # splitting silently misalign columns -- and misalignment still round
+    # trips, so verification would not catch it. Refuse the whole file.
+    if '"' in text:
+        return text
+    try:
+        # The tabular handler already sniffs delimiters by modal consistency;
+        # imported here rather than at module scope to keep this layer free of
+        # any dependency on the handler package.
+        from .handlers.data_handlers import TabularStructureHandler
+
+        lines, had_trailing = _split_keep_trailing(text)
+        separator = TabularStructureHandler._detect_separator(lines)
+        rows = _tabular_rows(lines, separator)
+        if rows is None:
+            return text
+
+        header = lines[rows[0]].split(separator)
+        data = [lines[index].split(separator) for index in rows[1:]]
+        width = len(header)
+
+        constant = [
+            position
+            for position in range(width)
+            if len({row[position] for row in data}) == 1
+        ]
+        if not constant or len(constant) >= width:
+            return text
+
+        dropped = set(constant)
+        keep = [position for position in range(width) if position not in dropped]
+        fields = [[position, header[position], data[0][position]] for position in constant]
+
+        folded = list(lines)
+        for index in rows:
+            cells = lines[index].split(separator)
+            folded[index] = separator.join(cells[position] for position in keep)
+
+        note = _tabular_note(len(data), separator, fields)
+        return note + _join(folded, had_trailing)
+    except (ValueError, IndexError):
+        return text
+
+
+def _tabular_note(count: int, separator: str, fields: list) -> str:
+    """The comment block that carries the folded columns."""
+    listed = ", ".join(f"{name}={value}" for _, name, value in fields)
+    payload = json.dumps({"sep": separator, "fields": fields}, separators=(",", ":"))
+    return (
+        f"# compresskit: every row below also has {listed}. Identical in all\n"
+        f"# {count} rows, removed here to save space -- treat every row as if it\n"
+        f"# still contained them.\n"
+        f"{_TABULAR_RESTORE_PREFIX}{payload}\n"
+    )
+
+
+def tabular_unfold_constants(text: str) -> str:
+    """Exact inverse of :func:`tabular_fold_constants`."""
+    if not text.startswith("# compresskit"):
+        return text
+    try:
+        head, _, body = text.partition(_TABULAR_RESTORE_PREFIX)
+        if not body:
+            return text
+        payload_line, _, remainder = body.partition("\n")
+        payload = json.loads(payload_line)
+        del head
+
+        separator = payload["sep"]
+        header_by_position = {int(p): name for p, name, _ in payload["fields"]}
+        value_by_position = {int(p): value for p, _, value in payload["fields"]}
+
+        lines, had_trailing = _split_keep_trailing(remainder)
+        rows = [index for index, line in enumerate(lines) if line.strip()]
+        if not rows:
+            return text
+
+        restored = list(lines)
+        for order, index in enumerate(rows):
+            kept = iter(lines[index].split(separator))
+            source = header_by_position if order == 0 else value_by_position
+            restored[index] = separator.join(
+                source[position] if position in source else next(kept)
+                for position in range(
+                    len(lines[index].split(separator)) + len(source)
+                )
+            )
+        return _join(restored, had_trailing)
+    except (ValueError, KeyError, IndexError, StopIteration):
+        return text
+
+
+def split_fold_note(text: str) -> tuple[str, str]:
+    """Separate a leading fold note from the payload it describes.
+
+    The note is an instruction to the model, not data, and the lossy pass
+    downstream cannot tell the difference -- left in place it gets truncated
+    like any other run of characters, and ``treat every entry as if it still
+    contained them`` becomes ``treat every ... them``. A fold whose note has
+    been shredded is strictly worse than no fold at all, so the note is lifted
+    out before reduction and put back afterwards.
+
+    Args:
+        text: Content that may begin with a fold note.
+
+    Returns:
+        ``(note, body)``. The note keeps its trailing newline and is ``""``
+        when there is none, so ``note + body == text`` always holds.
+    """
+    for prefix in (_JSON_RESTORE_PREFIX, _TABULAR_RESTORE_PREFIX):
+        marker = prefix.split(" ", 1)[0]  # "//" or "#"
+        if not text.startswith(marker + " compresskit"):
+            continue
+        start = text.find(prefix)
+        if start == -1:
+            continue
+        end = text.find("\n", start)
+        if end == -1:
+            continue
+        return text[: end + 1], text[end + 1 :]
+    return "", text
+
+
 def _smaller(candidate: str, original: str) -> bool:
     return len(candidate) < len(original)
 
@@ -461,7 +936,8 @@ def _smaller(candidate: str, original: str) -> bool:
 def compact_lossless(content: str, kind: str) -> str:
     """Dispatch format-native lossless compaction by ``kind``.
 
-    ``kind`` in {'log', 'search', 'diff', 'text', 'config'}. For reversible kinds the
+    ``kind`` in {'log', 'search', 'paths', 'diff', 'text', 'config',
+    'json_records', 'tabular_columns'}. For reversible kinds the
     round-trip is verified internally (modulo the intentionally-dropped
     non-semantic bits, e.g. ANSI color for logs); if verification fails or the
     result is not smaller, the original content is returned unchanged. Never
@@ -497,6 +973,21 @@ def compact_lossless(content: str, kind: str) -> str:
             # Pure path listings (find/ls -1/rg -l): fold repeated parent dirs.
             candidate = path_heading(content)
             if path_unheading(candidate) != content:
+                return content
+            return candidate if _smaller(candidate, content) else content
+
+        if kind == "json_records":
+            # Cross-record constant folding. Unlike the folds above this one
+            # changes the payload's shape, so the caller opts in; see
+            # CompressorConfig.fold_constant_fields.
+            candidate = json_fold_constants(content)
+            if json_unfold_constants(candidate) != content:
+                return content
+            return candidate if _smaller(candidate, content) else content
+
+        if kind == "tabular_columns":
+            candidate = tabular_fold_constants(content)
+            if tabular_unfold_constants(candidate) != content:
                 return content
             return candidate if _smaller(candidate, content) else content
 

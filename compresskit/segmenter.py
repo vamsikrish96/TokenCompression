@@ -242,7 +242,7 @@ def split_into_sections(content: str) -> list[ContentSection]:
             sections.append(
                 ContentSection(
                     content="\n".join(search_lines),
-                    content_type=ContentType.TEXT,
+                    content_type=ContentType.SEARCH,
                     start_line=start_line,
                     end_line=i - 1,
                 )

@@ -13,7 +13,9 @@ back into content that may still have to parse:
 * **No new newlines.** The newlines in the output are a subset of the ones in
   the input. A span taken from inside a JSON string value contains no raw
   newlines, so the reduced span cannot introduce one -- RFC 8259 section 7
-  forbids unescaped control characters in strings.
+  forbids unescaped control characters in strings. The single exception is
+  ``ReducerConfig.comment_prefix``, which the compressor sets only for source
+  code; see :func:`_omission_marker`.
 * **No dangling backslash.** Truncation never leaves a span ending in an odd
   run of backslashes, which would escape the closing quote of a JSON string.
 
@@ -28,8 +30,18 @@ from dataclasses import dataclass
 
 # Runs of spaces/tabs, and runs of blank lines. Kept as two patterns so that
 # horizontal whitespace can be collapsed without touching line structure.
-_HORIZONTAL_WS_RE = re.compile(r"[ \t]{2,}")
-_BLANK_LINES_RE = re.compile(r"\n[ \t]*(?:\n[ \t]*)+")
+#
+# The lookbehind restricts the collapse to *interior* runs. Without it, leading
+# indentation collapsed too: "        self._cache = {}" came back as
+# " self._cache = {}". In Python that is not a formatting nicety, it is a
+# change of meaning, and it left the reduced span unable to parse.
+_HORIZONTAL_WS_RE = re.compile(r"(?<=\S)[ \t]{2,}")
+# Only whitespace that sits on an otherwise BLANK line is part of the run. The
+# previous form ended with a trailing "[ \t]*" that reached past the final
+# newline and swallowed the indentation of the next real line, so
+# "…= {}\n\n    def place_order(" came back as "…= {}\ndef place_order(" --
+# dedented out of its class.
+_BLANK_LINES_RE = re.compile(r"\n(?:[ \t]*\n)+")
 
 
 @dataclass
@@ -52,6 +64,14 @@ class ReducerConfig:
             the span has lines, so whole lines survive instead of fragments of
             identifiers. Costs a little ratio, buys output that still reads as
             the thing it came from.
+        comment_prefix: Line-comment token of the surrounding language ("#",
+            "//"). When set, and when the cut landed on line boundaries, the
+            removed middle is replaced by a comment line stating how many lines
+            went -- ``# ... 12 lines omitted ...`` -- instead of an inline
+            ``" ... "``. The inline marker leaves output that no longer parses
+            and gives no clue whether two lines or two hundred were dropped.
+            This is the one case that adds a newline, so it is opt-in and the
+            compressor only sets it for code.
     """
 
     target_ratio: float = 0.3
@@ -61,6 +81,7 @@ class ReducerConfig:
     marker: str = " ... "
     head_fraction: float = 2 / 3
     snap_to_lines: bool = True
+    comment_prefix: str | None = None
 
 
 def collapse_repeated_lines(text: str, min_run: int = 2) -> str:
@@ -181,6 +202,184 @@ def _safe_cut(index: int, interior: set[int]) -> int:
     return index
 
 
+def _line_indent(line: str) -> int:
+    """Width of the leading whitespace run."""
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _skip_literal(text: str, index: int) -> int:
+    """Index just past the string literal starting at ``index``."""
+    quote = text[index]
+    if text.startswith(quote * 3, index):
+        end = text.find(quote * 3, index + 3)
+        return len(text) if end == -1 else end + 3
+    i = index + 1
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == quote or text[i] == "\n":
+            return i + 1
+        i += 1
+    return len(text)
+
+
+def _bracket_balance(text: str, comment_prefix: str | None) -> tuple[int, int]:
+    """``(net depth change, lowest depth reached)``, ignoring strings.
+
+    A removed chunk is safe to drop only when it is self-contained: it must
+    not close a bracket that was opened before it (lowest < 0), and must not
+    leave one open behind it (net != 0).
+    """
+    depth = 0
+    lowest = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        char = text[i]
+        if char in "\"'":
+            i = _skip_literal(text, i)
+            continue
+        if comment_prefix and text.startswith(comment_prefix, i):
+            newline = text.find("\n", i)
+            i = n if newline == -1 else newline
+            continue
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            lowest = min(lowest, depth)
+        i += 1
+    return depth, lowest
+
+
+def _block_safe_cuts(
+    text: str,
+    head_end: int,
+    tail_start: int,
+    comment_prefix: str | None,
+) -> tuple[int, int]:
+    """Move the cut points so the surviving lines still nest legally.
+
+    Keeping whole lines is not enough where indentation carries meaning.
+    Dropping ``if flag:`` but keeping the ``total *= 2`` beneath it leaves a
+    line indented under nothing; keeping ``for item in items:`` but dropping
+    everything under it leaves a header with no body. Both are syntax errors,
+    and both look like corruption rather than omission.
+
+    So the head sheds any trailing line that opens a block, and the tail
+    advances to the next line no deeper than the head's last kept line. Costs
+    a few more lines than the budget asked for; buys output that still parses.
+    """
+    line_starts = [0] + [i + 1 for i, char in enumerate(text) if char == "\n"]
+
+    def start_of_line(offset: int) -> int:
+        best = 0
+        for start in line_starts:
+            if start > offset:
+                break
+            best = start
+        return best
+
+    def line_at(start: int) -> str:
+        end = text.find("\n", start)
+        return text[start : end if end != -1 else len(text)]
+
+    def last_nonblank(before: int) -> str | None:
+        """The last line with content that ends at or before ``before``."""
+        cursor = before
+        while cursor > 0:
+            start = start_of_line(cursor - 1)
+            line = line_at(start)
+            if line.strip():
+                return line
+            cursor = start
+        return None
+
+    while head_end > 0:
+        previous = last_nonblank(head_end)
+        if previous is not None and previous.rstrip().endswith((":", "{")):
+            head_end = start_of_line(head_end - 1)
+        else:
+            break
+
+    # The head of a body span is often just the span's leading newline, whose
+    # "line" is empty. Reading an indent of 0 off it makes every real body
+    # line look too deep, and the tail search then walks off the end and drops
+    # the body entirely -- leaving a def with no statements under it.
+    anchor = last_nonblank(head_end)
+    if anchor is not None:
+        limit = _line_indent(anchor)
+    else:
+        limit = min(
+            (_line_indent(line) for line in text.split("\n") if line.strip()),
+            default=0,
+        )
+
+    def droppable(stop: int) -> bool:
+        """Can text[head_end:stop] be removed without breaking the code?"""
+        delta, lowest = _bracket_balance(text[head_end:stop], comment_prefix)
+        return delta == 0 and lowest == 0
+
+    while tail_start < len(text):
+        candidate = line_at(tail_start)
+        if candidate.strip() and _line_indent(candidate) <= limit and droppable(tail_start):
+            break
+        newline = text.find("\n", tail_start)
+        if newline == -1:
+            tail_start = len(text)
+            break
+        tail_start = newline + 1
+
+    # No cut in this span is safe -- collapsing it back onto the head tells
+    # the caller to leave the span alone. Losing the compression on one span
+    # is cheaper than emitting a file with an unmatched bracket in it.
+    if not droppable(tail_start):
+        return head_end, head_end
+
+    return head_end, tail_start
+
+
+def _omission_marker(
+    text: str,
+    head: str,
+    head_end: int,
+    tail_start: int,
+    config: ReducerConfig,
+) -> str:
+    """What to splice in where the middle was removed.
+
+    Defaults to the inline ``config.marker``. When the caller supplied a
+    ``comment_prefix`` and the cut fell on line boundaries, returns a comment
+    line naming the number of lines dropped instead, indented to match the
+    code it sits between. That is the difference between output the model can
+    still read as code and output that merely looks corrupted.
+    """
+    removed = text[head_end:tail_start]
+    if not config.comment_prefix or "\n" not in removed:
+        return config.marker
+    # An empty head is a clean boundary too -- it means the whole head was
+    # dropped rather than cut mid-line.
+    if head and not head.endswith("\n"):
+        return config.marker
+
+    # Indent the marker like the code it sits between. The tail is the better
+    # guide; when the cut ran to the end of the span there is no tail, so the
+    # head's last line answers instead -- otherwise the comment lands at
+    # column 0 inside an indented body.
+    line_end = text.find("\n", tail_start)
+    tail_line = text[tail_start : line_end if line_end != -1 else len(text)]
+    if not tail_line.strip():
+        tail_line = next(
+            (line for line in reversed(head.split("\n")) if line.strip()),
+            "",
+        )
+    indent = tail_line[: len(tail_line) - len(tail_line.lstrip(" \t"))]
+    count = removed.count("\n")
+    unit = "line" if count == 1 else "lines"
+    return f"{indent}{config.comment_prefix} ... {count} {unit} omitted ...\n"
+
+
 def truncate_middle(text: str, budget: int, config: ReducerConfig) -> str:
     """Keep the head and tail of ``text``, dropping the middle.
 
@@ -203,6 +402,24 @@ def truncate_middle(text: str, budget: int, config: ReducerConfig) -> str:
     if budget <= 0 or len(text) <= budget:
         return text
 
+    # A single physical code line has no *interior* newline for the
+    # snap-to-lines logic below to snap to -- a lone trailing "\n" does not
+    # count, since it sits beyond both the head and tail cut points for any
+    # budget short enough to need cutting at all, so the snap collapses to
+    # the same failure by a different path: head_end lands at 0 (no earlier
+    # break to snap back to) and tail_start is never snapped forward either,
+    # left exactly where the raw offset put it -- mid-word. That turned
+    # "before tax" into "ore tax": a fragment that reads as a typo, not a
+    # recognisable omission. There is no multi-line "# ... N lines omitted
+    # ..." convention to fall back on for a single line either, so refuse
+    # the cut entirely rather than splice mid-word. This can only happen for
+    # code (comment_prefix set): everywhere else, a single unbroken line --
+    # a long paragraph, a JSON string value -- is exactly the case
+    # truncate_middle exists to shorten, and already has its own tested
+    # behaviour for it.
+    if config.comment_prefix and "\n" not in text.rstrip("\n"):
+        return text
+
     keep_head = int(budget * config.head_fraction)
     keep_tail = budget - keep_head
     head_end = keep_head
@@ -215,9 +432,31 @@ def truncate_middle(text: str, budget: int, config: ReducerConfig) -> str:
         # rfind returning 0 is a real newline at index 0, not "not found";
         # -1 is the miss. Testing `> 0` silently skipped the snap on any span
         # that begins with a newline, which is most function bodies.
+        #
+        # But a snap to exactly 0 means the "line" it kept is empty -- a
+        # blank separator before the real content, not a boundary worth
+        # stopping at. For code (comment_prefix set) that is fine and
+        # already relied on: it produces "def foo():\n    # ... N lines
+        # omitted ...\n", a fully-explained omission. Plain text has no such
+        # comment to say what happened, so keeping literally nothing as head
+        # silently discarded a whole first line the budget had room for --
+        # measured on a five-line paragraph with real budget to spare, this
+        # is what turned a paragraph naming the bug, the ticket and the
+        # exact failure into just its last clause. Treat it like no
+        # backward boundary was found at all, and look forward for a real
+        # line instead.
         snapped_head = text.rfind("\n", 0, head_end)
-        if snapped_head >= 0:
+        if snapped_head > 0 or (snapped_head == 0 and config.comment_prefix):
             head_end = snapped_head + 1
+        else:
+            # The budget does not reach the first line break, so there is no
+            # whole line behind the cut to fall back to. Take the first line
+            # when it still fits the budget, otherwise keep no head at all.
+            # Cutting here instead is the one option that yields neither valid
+            # text nor a recognisable omission -- it produced
+            # "self.repo = rep ..." mid-identifier.
+            forward = text.find("\n", head_end)
+            head_end = forward + 1 if 0 <= forward + 1 <= budget else 0
         # Snap the tail BACK to the start of the line it lands in, not forward
         # to the next one: forward-snapping onto a trailing newline yields an
         # empty tail, and the fallback then cuts mid-identifier anyway. Going
@@ -230,6 +469,20 @@ def truncate_middle(text: str, budget: int, config: ReducerConfig) -> str:
         if tail_start <= head_end:
             return text
 
+        # A head of zero means the first whole line did not fit the budget
+        # at all -- correct to refuse rather than cut mid-word, per the
+        # forward-search fallback above. For code that is still a good
+        # outcome: paired with `comment_prefix` it reads as "def foo():\n
+        # # ... N lines omitted ...\n", a fully-explained omission. Plain
+        # text has no such comment, so a bare " ... " at the very start
+        # says nothing about what vanished -- measured on a short list item
+        # whose one wrapped line was longer than its own budget, this threw
+        # away the entire item with only a trailing clause left to show for
+        # it. Refusing the cut here costs this one span its savings, not
+        # its content.
+        if head_end == 0 and not config.comment_prefix:
+            return text
+
     # Never cut through a backslash escape. Both cut points move backwards:
     # the head sheds a partial escape, and the tail moves back to the escape's
     # own backslash so it survives whole.
@@ -240,10 +493,18 @@ def truncate_middle(text: str, budget: int, config: ReducerConfig) -> str:
         if tail_start <= head_end:
             return text
 
+    # Code only: whole lines are not enough where indentation carries meaning.
+    if config.comment_prefix and config.snap_to_lines and "\n" in text:
+        head_end, tail_start = _block_safe_cuts(
+            text, head_end, tail_start, config.comment_prefix
+        )
+        if tail_start <= head_end:
+            return text
+
     head = trim_dangling_escape(text[:head_end])
     tail = text[tail_start:]
 
-    candidate = head + config.marker + tail
+    candidate = head + _omission_marker(text, head, head_end, tail_start, config) + tail
     # Truncation that grows the span is not truncation. Short spans with a
     # long marker hit this.
     return candidate if len(candidate) < len(text) else text

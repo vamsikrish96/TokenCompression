@@ -18,6 +18,7 @@ from .text_handlers import (
     DiffStructureHandler,
     LogStructureHandler,
     MarkdownStructureHandler,
+    SearchStructureHandler,
 )
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "MixedContentHandler",
     "MarkdownStructureHandler",
     "NoOpHandler",
+    "SearchStructureHandler",
     "StructureHandler",
     "TabularStructureHandler",
     "extract_json_schema",

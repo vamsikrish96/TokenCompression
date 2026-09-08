@@ -49,6 +49,7 @@ from .handlers import (
     MarkdownStructureHandler,
     MixedContentHandler,
     NoOpHandler,
+    SearchStructureHandler,
     StructureHandler,
     TabularStructureHandler,
     extract_json_schema,
@@ -96,6 +97,7 @@ __all__ = [
     "LogStructureHandler",
     "MarkdownStructureHandler",
     "MixedContentHandler",
+    "SearchStructureHandler",
     "extract_json_schema",
     "is_tree_sitter_available",
     # Masks

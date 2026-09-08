@@ -39,6 +39,14 @@ class HandlerResult:
             sees identical whole lines. 180 copies of a warning were then
             removed one at a time, silently, with no "[x180]" left behind to
             tell the model they had ever been there.
+        span_roles: Optional per-character role label, parallel to the mask.
+            The mask says *whether* a character may be cut; this says *what
+            kind* of material it is, so a reducer can spend its budget on the
+            cheapest spans first. A handler that marks a whole function body
+            compressible cannot otherwise distinguish the repeated entries of
+            a lookup table from the control flow of an algorithm -- both
+            arrive as an undifferentiated run of False. Empty string means
+            "no opinion". See :data:`compresskit.handlers.code_handler.ROLE_DATA`.
         metadata: Handler-specific detail.
     """
 
@@ -46,6 +54,7 @@ class HandlerResult:
     handler_name: str
     confidence: float = 1.0  # How confident the handler is in its detection
     force_compressible: list[bool] | None = None
+    span_roles: list[str] | None = None
     metadata: dict = field(default_factory=dict)
 
     @property

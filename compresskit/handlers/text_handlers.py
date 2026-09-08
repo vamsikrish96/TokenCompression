@@ -15,6 +15,7 @@ import re
 from collections.abc import Iterator
 from typing import Any
 
+from ..detector import _SEARCH_LINE_RE
 from ..masks import StructureMask
 from .base import BaseStructureHandler, HandlerResult
 
@@ -33,6 +34,34 @@ def _iter_lines(content: str) -> Iterator[tuple[int, int, str]]:
         end = length if newline == -1 else newline + 1
         yield start, end, content[start:end]
         start = end
+
+
+_SEVERITY_ORDER = {
+    "TRACE": 0,
+    "DEBUG": 1,
+    "INFO": 2,
+    "NOTICE": 3,
+    "WARN": 4,
+    "WARNING": 4,
+    "ERROR": 5,
+    "FATAL": 6,
+    "CRITICAL": 6,
+}
+
+_LEVEL_RE = re.compile(
+    r"\[?\b(TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|FATAL|CRITICAL)\b\]?"
+)
+
+# A continuation line: stack-trace frames and wrapped messages, which are
+# indented or start with a Java/Python frame marker.
+_CONTINUATION_RE = re.compile(r"^(?:[ \t]+|\tat |Caused by:|\s*File \")")
+
+_HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+\S")
+_SETEXT_RE = re.compile(r"^[ \t]*(?:=+|-{2,})[ \t]*$")
+_FENCE_RE = re.compile(r"^[ \t]*(?:```|~~~)")
+_LIST_MARKER_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+")
+_QUOTE_MARKER_RE = re.compile(r"^[ \t]*>+[ \t]*")
+_TABLE_SEPARATOR_RE = re.compile(r"^[ \t]*\|?[ \t]*:?-{2,}:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?")
 
 
 class DiffStructureHandler(BaseStructureHandler):
@@ -152,25 +181,12 @@ class LogStructureHandler(BaseStructureHandler):
         1
     """
 
-    _SEVERITY_ORDER = {
-        "TRACE": 0,
-        "DEBUG": 1,
-        "INFO": 2,
-        "NOTICE": 3,
-        "WARN": 4,
-        "WARNING": 4,
-        "ERROR": 5,
-        "FATAL": 6,
-        "CRITICAL": 6,
-    }
-
-    _LEVEL_RE = re.compile(
-        r"\[?\b(TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|FATAL|CRITICAL)\b\]?"
-    )
-
-    # A continuation line: stack-trace frames and wrapped messages, which are
-    # indented or start with a Java/Python frame marker.
-    _CONTINUATION_RE = re.compile(r"^(?:[ \t]+|\tat |Caused by:|\s*File \")")
+    # Module-level so :mod:`compresskit.relevance` can build the same notion
+    # of "anchor material" (severity-floor lines and their continuations)
+    # without a second copy of these regexes drifting out of sync.
+    _SEVERITY_ORDER = _SEVERITY_ORDER
+    _LEVEL_RE = _LEVEL_RE
+    _CONTINUATION_RE = _CONTINUATION_RE
 
     def __init__(
         self,
@@ -187,6 +203,27 @@ class LogStructureHandler(BaseStructureHandler):
         super().__init__(name="log")
         self.severity_floor = self._SEVERITY_ORDER.get(severity_floor.upper(), 4)
         self.prefix_chars = prefix_chars
+
+    @staticmethod
+    def _protect_line_boundary(
+        mask: list[bool], content: str, start: int, end: int
+    ) -> None:
+        """Keep a compressible line's own trailing newline structural.
+
+        Without this, two unrelated lines with nothing preserved between
+        them -- two different INFO messages, or two different stack frames
+        under a dropped error -- sit contiguous in the mask and the generic
+        reducer treats them as one span. It then has no way to know a line
+        boundary was ever there, and can cut a fragment of one line right
+        onto the front of another: "File ...order_service.py", line 56 ..."
+        spliced directly onto "discount = subtotal * (percent_off / 100)"
+        from a different frame reads as one coherent line while asserting
+        something that never happened. Splitting every line into its own
+        span turns that into a same-line risk at worst (see
+        ``ReducerConfig.snap_to_lines``), never a cross-line splice.
+        """
+        if end > start and content[end - 1] == "\n":
+            mask[end - 1] = True
 
     def _extract_mask(
         self,
@@ -256,6 +293,8 @@ class LogStructureHandler(BaseStructureHandler):
                 if in_preserved_block:
                     mask[start:end] = [True] * (end - start)
                     preserved_lines += 1
+                else:
+                    self._protect_line_boundary(mask, content, start, end)
                 continue
 
             in_preserved_block = False
@@ -264,6 +303,7 @@ class LogStructureHandler(BaseStructureHandler):
             # fixed number of characters (usually enough for a timestamp).
             prefix_end = match.end() if match else min(len(stripped), self.prefix_chars)
             mask[start : start + prefix_end] = [True] * prefix_end
+            self._protect_line_boundary(mask, content, start, end)
 
         return HandlerResult(
             mask=StructureMask(tokens=tokens, mask=mask),
@@ -299,12 +339,16 @@ class MarkdownStructureHandler(BaseStructureHandler):
         1
     """
 
-    _HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+\S")
-    _SETEXT_RE = re.compile(r"^[ \t]*(?:=+|-{2,})[ \t]*$")
-    _FENCE_RE = re.compile(r"^[ \t]*(?:```|~~~)")
-    _LIST_MARKER_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+")
-    _QUOTE_MARKER_RE = re.compile(r"^[ \t]*>+[ \t]*")
-    _TABLE_SEPARATOR_RE = re.compile(r"^[ \t]*\|?[ \t]*:?-{2,}:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?")
+    # Module-level so :mod:`compresskit.relevance` can recognise the same
+    # structural lines (headings, fences, table rows) without a second copy
+    # of these regexes drifting out of sync -- exactly the reason the log
+    # regexes moved up earlier.
+    _HEADING_RE = _HEADING_RE
+    _SETEXT_RE = _SETEXT_RE
+    _FENCE_RE = _FENCE_RE
+    _LIST_MARKER_RE = _LIST_MARKER_RE
+    _QUOTE_MARKER_RE = _QUOTE_MARKER_RE
+    _TABLE_SEPARATOR_RE = _TABLE_SEPARATOR_RE
 
     def __init__(self, preserve_fenced_code: bool = True):
         """Initialize the Markdown handler.
@@ -363,4 +407,51 @@ class MarkdownStructureHandler(BaseStructureHandler):
             handler_name=self.name,
             confidence=0.85,
             metadata={"headings": headings, "unbalanced_fence": in_fence},
+        )
+
+
+class SearchStructureHandler(BaseStructureHandler):
+    """Handler for grep-style search output (``path:line:text``).
+
+    Preserves everything. A match line has no less-important "body" the way
+    a log message does -- it is exactly what was asked for, in full, and
+    truncating it risks turning a real result into a plausible-looking but
+    wrong one. Same reasoning as ``DiffStructureHandler.preserve_context``:
+    every line here is signal, not context to trim.
+
+    The one deliberate way to shrink this content is
+    :func:`compresskit.relevance.filter_search_by_relevance`, which runs
+    before this handler ever sees the content and drops whole low-relevance
+    match lines against an explicit query. What survives that selection is
+    then never touched again.
+
+    Example:
+        >>> handler = SearchStructureHandler()
+        >>> result = handler.get_mask("app.py:12:def f():\\n")
+        >>> result.preservation_ratio
+        1.0
+    """
+
+    def __init__(self) -> None:
+        super().__init__(name="search")
+
+    def can_handle(self, content: str) -> bool:
+        """Check whether any line looks like a ``path:line:`` match."""
+        return any(
+            _SEARCH_LINE_RE.match(line.rstrip("\n"))
+            for _start, _end, line in _iter_lines(content)
+        )
+
+    def _extract_mask(
+        self,
+        content: str,
+        tokens: list[str],
+        **kwargs: Any,
+    ) -> HandlerResult:
+        """Protect the whole content -- there is nothing safe to cut here."""
+        return HandlerResult(
+            mask=StructureMask(tokens=tokens, mask=[True] * len(content)),
+            handler_name=self.name,
+            confidence=0.8,
+            metadata={},
         )
